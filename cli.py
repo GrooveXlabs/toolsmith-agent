@@ -5,13 +5,16 @@ Main entry point for the autonomous tool-building agent.
 """
 
 import os
+import re
 import sys
 import json
+import subprocess
 import click
 from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 
 from toolsmith.config import load_config
 from toolsmith.discoverer import TrendDiscoverer
@@ -21,6 +24,266 @@ from toolsmith.generator import ProjectGenerator
 from toolsmith.publisher import GitHubPublisher
 
 console = Console()
+
+
+def _load_skill_checklist(skill_name):
+    """Load checklist items from a gstack SKILL.md file."""
+    skill_path = Path.home() / ".kimi" / "skills" / skill_name / "SKILL.md"
+    if not skill_path.exists():
+        return []
+    text = skill_path.read_text(encoding="utf-8")
+    # Extract checklist lines like "- [ ] item"
+    items = re.findall(r"- \[ \]\s*(.+)", text)
+    return items
+
+
+def _scan_for_patterns(project_dir, patterns, file_globs=None):
+    """Scan project files for regex patterns. Returns list of matches."""
+    if file_globs is None:
+        file_globs = ["*.py", "*.js", "*.ts", "*.json", "*.md", "*.toml", "*.yaml", "*.yml"]
+    matches = []
+    project_path = Path(project_dir)
+    skip_dirs = {".venv", "venv", "node_modules", "__pycache__", ".git", "dist", "build", ".pytest_cache", ".mypy_cache"}
+    for glob in file_globs:
+        for filepath in project_path.rglob(glob):
+            if not filepath.is_file():
+                continue
+            # Skip dependency / cache directories
+            if any(part in skip_dirs for part in filepath.parts):
+                continue
+            try:
+                content = filepath.read_text(encoding="utf-8", errors="ignore")
+                for pattern in patterns:
+                    for m in re.finditer(pattern, content):
+                        line_num = content[:m.start()].count("\n") + 1
+                        matches.append((str(filepath.relative_to(project_path)), line_num, m.group(0).strip()))
+            except Exception:
+                continue
+    return matches
+
+
+def _run_shell(cmd, cwd=None):
+    """Run a shell command and return (rc, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60
+        )
+        return result.returncode, result.stdout, result.stderr
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def _run_gstack_gate(project_dir, skill_name, title, emoji, checks_fn):
+    """Run a single gstack review gate."""
+    console.rule(f"[{emoji}] gstack — {title}")
+    checklist = _load_skill_checklist(skill_name)
+    if checklist:
+        console.print(f"[dim]Loaded {len(checklist)} checklist items from {skill_name}[/dim]")
+
+    findings = checks_fn(project_dir, checklist)
+
+    passed = all(f.get("pass", True) for f in findings)
+    status = "[green]PASS[/green]" if passed else "[red]FAIL[/red]"
+    console.print(f"\n[{emoji}] Gate {status}: {title}")
+
+    if not passed:
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("Severity")
+        table.add_column("Finding")
+        for f in findings:
+            if not f.get("pass", True):
+                table.add_row(f.get("severity", "HIGH"), f.get("message", ""))
+        console.print(table)
+
+    return passed, findings
+
+
+def _security_checks(project_dir, checklist):
+    """Automated security audit checks."""
+    findings = []
+    # Secret-like patterns
+    secret_patterns = [
+        r"(?i)(api[_-]?key|password|secret|token)\s*=\s*[\"'][^\"']{8,}[\"']",
+        r"(?i)sk-[a-zA-Z0-9]{20,}",
+        r"ghp_[a-zA-Z0-9]{36}",
+    ]
+    secret_matches = _scan_for_patterns(project_dir, secret_patterns)
+    for fp, ln, match in secret_matches[:5]:
+        findings.append({"pass": False, "severity": "CRITICAL", "message": f"Possible secret in {fp}:{ln} — {match[:40]}..."})
+
+    # Dangerous functions
+    danger_matches = _scan_for_patterns(project_dir, [r"(?<!# )\beval\b", r"\bos\.system\b", r"\bsubprocess\.call\b.*shell\s*=\s*True"])
+    for fp, ln, match in danger_matches[:5]:
+        findings.append({"pass": False, "severity": "HIGH", "message": f"Dangerous call in {fp}:{ln} — {match}"})
+
+    # Check for http (warn) — skip test files
+    http_matches = _scan_for_patterns(project_dir, [r"http://(?!localhost|127\.0\.0\.1)"])
+    for fp, ln, match in http_matches[:3]:
+        if "test_" in fp or "_test.py" in fp:
+            continue  # Tests use http:// for validation
+        findings.append({"pass": False, "severity": "MEDIUM", "message": f"Insecure HTTP in {fp}:{ln} — {match}"})
+
+    if not findings:
+        findings.append({"pass": True, "severity": "INFO", "message": "No obvious security issues detected."})
+    return findings
+
+
+def _code_review_checks(project_dir, checklist):
+    """Automated code review checks."""
+    findings = []
+    # AI slop detection
+    slop_patterns = [
+        (r"#\s*TODO:\s*implement", "Placeholder comment (TODO: implement)"),
+        (r"except\s*:\s*\n?\s*pass", "Fake error handling (except: pass)"),
+        (r"(?i)#\s*FIXME\s*", "FIXME comment remains"),
+    ]
+    for pattern, desc in slop_patterns:
+        matches = _scan_for_patterns(project_dir, [pattern])
+        for fp, ln, _ in matches[:5]:
+            findings.append({"pass": False, "severity": "MEDIUM", "message": f"{desc} in {fp}:{ln}"})
+
+    # Missing type hints in Python files (skip deps, tests, generated)
+    skip_dirs = {".venv", "venv", "node_modules", "__pycache__", ".git", "dist", "build", ".pytest_cache", "site-packages"}
+    py_files = [f for f in Path(project_dir).rglob("*.py") if not any(part in skip_dirs for part in f.parts)]
+    for py_file in py_files[:20]:
+        if py_file.name.startswith("test_") or py_file.name.endswith("_test.py"):
+            continue
+        try:
+            content = py_file.read_text(encoding="utf-8", errors="ignore")
+            lines = content.splitlines()
+            for i, line in enumerate(lines, 1):
+                if line.strip().startswith("def ") and "->" not in line and "__init__" not in line:
+                    # Check next 10 lines for multi-line return type annotation
+                    window = lines[i-1:i+10]
+                    if any("->" in wl for wl in window):
+                        continue
+                    findings.append({"pass": False, "severity": "LOW", "message": f"Missing return type hint: {py_file.name}:{i}"})
+                    if len([f for f in findings if f.get("severity") == "LOW"]) >= 5:
+                        break
+        except Exception:
+            pass
+
+    if not findings:
+        findings.append({"pass": True, "severity": "INFO", "message": "Code review clean."})
+    return findings
+
+
+def _qa_checks(project_dir, checklist):
+    """Automated QA checks."""
+    findings = []
+    # Try to run pytest
+    rc, out, err = _run_shell("python -m pytest --tb=short -q", cwd=project_dir)
+    if rc == 0:
+        findings.append({"pass": True, "severity": "INFO", "message": "pytest passed."})
+    elif rc == 5:
+        findings.append({"pass": False, "severity": "MEDIUM", "message": "No tests found (pytest exit 5)."})
+    else:
+        findings.append({"pass": False, "severity": "HIGH", "message": f"Tests failed (exit {rc})."})
+
+    # Check for test files
+    test_files = list(Path(project_dir).rglob("test_*.py")) + list(Path(project_dir).rglob("*_test.py"))
+    if not test_files:
+        findings.append({"pass": False, "severity": "MEDIUM", "message": "No test files discovered."})
+
+    return findings
+
+
+def _design_review_checks(project_dir, checklist):
+    """Automated design/UX review checks."""
+    findings = []
+    readme_path = Path(project_dir) / "README.md"
+    if not readme_path.exists():
+        findings.append({"pass": False, "severity": "HIGH", "message": "README.md missing."})
+    else:
+        readme = readme_path.read_text(encoding="utf-8", errors="ignore")
+        if "```" not in readme:
+            findings.append({"pass": False, "severity": "MEDIUM", "message": "README has no code examples."})
+        if len(readme) > 5000 and "quickstart" not in readme.lower() and "example" not in readme.lower():
+            findings.append({"pass": False, "severity": "MEDIUM", "message": "README is long but lacks quickstart/example."})
+
+    # Check for .env.example (good practice)
+    if not (Path(project_dir) / ".env.example").exists():
+        findings.append({"pass": False, "severity": "LOW", "message": "No .env.example file."})
+
+    if not findings or all(f.get("pass", True) for f in findings):
+        findings.insert(0, {"pass": True, "severity": "INFO", "message": "Design review checks passed."})
+    return findings
+
+
+def _ship_checks(project_dir, checklist, gate_results):
+    """Ship gate — validates all prior gates and release readiness."""
+    findings = []
+    failed_gates = [name for name, (passed, _) in gate_results.items() if not passed]
+    if failed_gates:
+        findings.append({"pass": False, "severity": "CRITICAL", "message": f"Prior gates failed: {', '.join(failed_gates)}"})
+
+    # Version file check
+    version_files = ["pyproject.toml", "package.json", "Cargo.toml", "setup.py"]
+    has_version = any((Path(project_dir) / vf).exists() for vf in version_files)
+    if not has_version:
+        findings.append({"pass": False, "severity": "MEDIUM", "message": "No version file (pyproject.toml/package.json) found."})
+
+    if not findings or all(f.get("pass", True) for f in findings):
+        findings.insert(0, {"pass": True, "severity": "INFO", "message": "Ship gate ready."})
+    return findings
+
+
+def run_gstack_review(project_dir, force=False):
+    """Run the full gstack review pipeline on a generated project."""
+    console.rule("[bold white on magenta] GSTACK REVIEW PIPELINE ")
+    console.print("[dim]Reading skill definitions from ~/.kimi/skills/gstack-*[/dim]\n")
+
+    gates = [
+        ("gstack-security-audit", "Security Audit", "🔒", _security_checks),
+        ("gstack-code-review", "Code Review", "🔍", _code_review_checks),
+        ("gstack-qa", "QA Pipeline", "🧪", _qa_checks),
+        ("gstack-design-review", "Design Review", "🎨", _design_review_checks),
+    ]
+
+    gate_results = {}
+    for skill_name, title, emoji, checks_fn in gates:
+        passed, findings = _run_gstack_gate(project_dir, skill_name, title, emoji, checks_fn)
+        gate_results[skill_name] = (passed, findings)
+        console.print("")
+
+    # Ship gate depends on all prior gates
+    ship_passed, ship_findings = _run_gstack_gate(
+        project_dir, "gstack-ship", "Release / Ship", "🚀",
+        lambda d, c: _ship_checks(d, c, gate_results)
+    )
+    gate_results["gstack-ship"] = (ship_passed, ship_findings)
+
+    # Summary
+    console.rule("[bold]GSTACK REVIEW SUMMARY")
+    table = Table(show_header=True, header_style="bold blue")
+    table.add_column("Gate")
+    table.add_column("Status")
+    for skill_name, title, _, _ in gates:
+        passed, _ = gate_results[skill_name]
+        table.add_row(title, "[green]PASS[/green]" if passed else "[red]FAIL[/red]")
+    table.add_row("Release / Ship", "[green]PASS[/green]" if ship_passed else "[red]FAIL[/red]")
+    console.print(table)
+
+    all_passed = all(passed for passed, _ in gate_results.values())
+    if all_passed:
+        console.print(Panel.fit(
+            "[bold green]🚀 All gstack gates passed! Ready to ship.[/bold green]",
+            border_style="green"
+        ))
+        return True
+    elif force:
+        console.print(Panel.fit(
+            "[bold yellow]⚠️ Some gates failed, but --force is set. Proceeding.[/bold yellow]",
+            border_style="yellow"
+        ))
+        return True
+    else:
+        console.print(Panel.fit(
+            "[bold red]⛔ gstack review blocked shipping.[/bold red]\n"
+            "Fix the issues above or use --force to override.",
+            border_style="red"
+        ))
+        return False
 
 
 @click.group()
@@ -122,8 +385,10 @@ def ideate(ctx, from_analysis, output):
 @click.option('--concept', '-c', required=True, help='Path to concept JSON')
 @click.option('--lang', '-l', default=None, help='Target language (python/typescript/rust/go)')
 @click.option('--output-dir', '-o', default='./generated', help='Output directory')
+@click.option('--gstack-review', is_flag=True, help='Run gstack review gates after build')
+@click.option('--force', is_flag=True, help='Force ship even if gstack gates fail')
 @click.pass_context
-def build(ctx, concept, lang, output_dir):
+def build(ctx, concept, lang, output_dir, gstack_review, force):
     """⚒️ Build a complete project from concept"""
     config = ctx.obj['config']
     lang = lang or config.default_lang
@@ -138,6 +403,11 @@ def build(ctx, concept, lang, output_dir):
     files = list(Path(project_dir).rglob('*'))
     files = [f for f in files if f.is_file()]
     console.print(f"[dim]Generated {len(files)} files[/dim]")
+
+    if gstack_review:
+        ok = run_gstack_review(project_dir, force=force)
+        if not ok:
+            sys.exit(1)
 
 
 @cli.command()
@@ -160,8 +430,10 @@ def publish(ctx, project_dir, repo_name):
 @click.option('--limit', '-l', default=10, help='Repos to analyze')
 @click.option('--lang', '-l2', default=None, help='Build language')
 @click.option('--auto-publish', is_flag=True, help='Auto-publish to GitHub')
+@click.option('--gstack-review', is_flag=True, help='Run gstack review gates after build')
+@click.option('--force', is_flag=True, help='Force ship even if gstack gates fail')
 @click.pass_context
-def full_cycle(ctx, category, limit, lang, auto_publish):
+def full_cycle(ctx, category, limit, lang, auto_publish, gstack_review, force):
     """🔄 Run full discovery → analyze → ideate → build → publish cycle"""
     config = ctx.obj['config']
     lang = lang or config.default_lang
@@ -201,6 +473,13 @@ def full_cycle(ctx, category, limit, lang, auto_publish):
     console.rule("[bold magenta]Step 4: Build")
     project_dir = generator.generate(concept_path, f"./generated/{concept.new_name.lower()}")
     console.print(f"[green]✓[/green] Built at {project_dir}")
+    
+    # Step 4.5: gstack Review
+    if gstack_review:
+        ok = run_gstack_review(project_dir, force=force)
+        if not ok:
+            console.print("[red]✗[/red] gstack review blocked publish. Exiting.")
+            return
     
     # Step 5: Publish
     if auto_publish:
