@@ -1,0 +1,72 @@
+name: 🤖 ToolSmith Agent Cycle
+
+on:
+  schedule:
+    # Run every Sunday at 2 AM UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+    inputs:
+      category:
+        description: 'Tool category to explore'
+        required: true
+        default: 'web-scraping'
+        type: choice
+        options:
+          - web-scraping
+          - ai-ml
+          - devops
+          - security
+          - data
+          - api
+          - frontend
+      language:
+        description: 'Target language'
+        required: true
+        default: 'python'
+        type: choice
+        options:
+          - python
+          - typescript
+          - rust
+          - go
+      auto_publish:
+        description: 'Auto-publish to GitHub'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  toolsmith-cycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run ToolSmith cycle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GROOVEXLABS_ORG: GrooveXlabs
+        run: |
+          CATEGORY="${{ github.event.inputs.category || 'web-scraping' }}"
+          LANG="${{ github.event.inputs.language || 'python' }}"
+          AUTO="${{ github.event.inputs.auto_publish && '--auto-publish' || '' }}"
+          python cli.py full-cycle --category "$CATEGORY" --lang "$LANG" $AUTO
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolsmith-output
+          path: |
+            analysis_*.json
+            concept_*.json
+            generated/
